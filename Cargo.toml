@@ -1,0 +1,12 @@
+[package]
+name = "packet-stream-codec"
+version = "0.1.0"
+authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
+description = "Implementation of the packet-stream codec used by muxrpc, in rust."
+repository = "https://github.com/AljoschaMeyer/packet-stream-codec-rs"
+readme = "README.md"
+license = "GPL-3.0"
+
+[dependencies]
+futures = "0.1.17"
+tokio-io = "0.1.4"
