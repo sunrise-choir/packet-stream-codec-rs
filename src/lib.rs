@@ -3,28 +3,25 @@
 #![deny(missing_docs)]
 
 #[macro_use]
-extern crate futures;
-extern crate tokio_io;
-#[macro_use]
-extern crate atm_io_utils;
+extern crate futures_core;
+extern crate futures_sink;
+extern crate futures_io;
 
-#[cfg(test)]
-extern crate partial_io;
-#[cfg(test)]
-extern crate quickcheck;
 #[cfg(test)]
 extern crate async_ringbuffer;
 #[cfg(test)]
-extern crate rand;
+extern crate futures;
 
-use std::io;
-use std::io::ErrorKind::{WriteZero, UnexpectedEof, InvalidData, InvalidInput, WouldBlock,
-                         Interrupted};
 use std::mem::transmute;
 use std::slice::from_raw_parts_mut;
 
-use futures::{Sink, Stream, Poll, StartSend, AsyncSink, Async};
-use tokio_io::{AsyncRead, AsyncWrite};
+use futures_io::Error;
+use futures_io::ErrorKind::{WriteZero, UnexpectedEof, InvalidData, InvalidInput};
+use futures_core::{Poll, Async, Stream};
+use futures_core::Async::{Ready, Pending};
+use futures_core::task::Context;
+use futures_sink::Sink;
+use futures_io::{AsyncRead, AsyncWrite};
 
 /// The ids used by packet-stream packets
 pub type PacketId = i32;
@@ -150,48 +147,52 @@ impl<W, B> Sink for CodecSink<W, B>
     /// The length of the [u8] may not be larger than `u32::max_value()`.
     /// Otherwise, `start_send` returns an error of kind `InvalidInput`.
     type SinkItem = (B, Metadata);
-    type SinkError = io::Error;
+    type SinkError = Error;
 
-    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+    fn poll_ready(&mut self, cx: &mut Context) -> Result<Async<()>, Self::SinkError> {
         match self.state {
-            SinkState::Idle => {
-                if item.0.as_ref().len() as u32 > u32::max_value() {
-                    Err(io::Error::new(InvalidInput, "item too large for packet-stream-codec"))
-                } else {
-                    self.bytes = Some(item.0);
-                    self.state = SinkState::Buffering(WritePacketState::Flags(item.1.to_be()));
-                    self.poll_complete().map(|_| AsyncSink::Ready)
-                }
-            }
+            SinkState::Idle => Ok(Ready(())),
 
-            SinkState::Buffering(_) => {
-                match self.poll_complete() {
-                    Ok(Async::Ready(_)) => self.start_send(item),
-                    Ok(Async::NotReady) => Ok(AsyncSink::NotReady(item)),
-                    Err(e) => Err(e),
-                }
-            }
+            SinkState::Buffering(_) => self.poll_flush(cx),
 
             SinkState::EndOfStream(_) |
             SinkState::Shutdown => panic!("Called start_send on CodecSink after calling close"),
         }
     }
 
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+    fn start_send(&mut self, item: Self::SinkItem) -> Result<(), Self::SinkError> {
         match self.state {
-            SinkState::Idle => Ok(Async::Ready(retry_nb!(self.writer.flush()))),
+            SinkState::Idle => {
+                if item.0.as_ref().len() as u32 > u32::max_value() {
+                    Err(Error::new(InvalidInput, "item too large for packet-stream-codec"))
+                } else {
+                    self.bytes = Some(item.0);
+                    self.state = SinkState::Buffering(WritePacketState::Flags(item.1.to_be()));
+                    Ok(())
+                }
+            }
+
+            SinkState::Buffering(_) |
+            SinkState::EndOfStream(_) |
+            SinkState::Shutdown => panic!("CodecSink not ready to start_send"),
+        }
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context) -> Result<Async<()>, Self::SinkError> {
+        match self.state {
+            SinkState::Idle => self.writer.poll_flush(cx),
 
             SinkState::Buffering(state) => {
                 match state {
                     WritePacketState::Flags(Metadata { flags, id }) => {
-                        let written = retry_nb!(self.writer.write(&[flags]));
+                        let written = try_ready!(self.writer.poll_write(cx, &[flags]));
 
                         if written == 0 {
-                            Err(io::Error::new(WriteZero, "failed to write packet flags"))
+                            Err(Error::new(WriteZero, "failed to write packet flags"))
                         } else {
                             debug_assert!(written == 1);
                             self.state = SinkState::Buffering(WritePacketState::Length(id, 0));
-                            self.poll_complete()
+                            self.poll_flush(cx)
                         }
                     }
 
@@ -203,12 +204,12 @@ impl<W, B> Sink for CodecSink<W, B>
                         };
 
                         while offset < 4 {
-                            let written = retry_nb!(self.writer.write(&len_bytes[offset as
-                                                                       usize..]));
+                            let written =
+                                try_ready!(self.writer.poll_write(cx,
+                                                                  &len_bytes[offset as usize..]));
 
                             if written == 0 {
-                                return Err(io::Error::new(WriteZero,
-                                                          "failed to write packet length"));
+                                return Err(Error::new(WriteZero, "failed to write packet length"));
                             } else {
                                 offset += written as u8;
                                 self.state = SinkState::Buffering(WritePacketState::Length(id,
@@ -217,17 +218,18 @@ impl<W, B> Sink for CodecSink<W, B>
                         }
 
                         self.state = SinkState::Buffering(WritePacketState::Id(id, 0));
-                        self.poll_complete()
+                        self.poll_flush(cx)
                     }
 
                     WritePacketState::Id(id, mut offset) => {
                         let id_bytes = unsafe { transmute::<_, [u8; 4]>(id) };
                         while offset < 4 {
-                            let written = retry_nb!(self.writer.write(&id_bytes[offset as
-                                                                       usize..]));
+                            let written =
+                                try_ready!(self.writer.poll_write(cx,
+                                                                  &id_bytes[offset as usize..]));
 
                             if written == 0 {
-                                return Err(io::Error::new(WriteZero, "failed to write packet id"));
+                                return Err(Error::new(WriteZero, "failed to write packet id"));
                             } else {
                                 offset += written as u8;
                                 self.state = SinkState::Buffering(WritePacketState::Id(id, offset));
@@ -235,7 +237,7 @@ impl<W, B> Sink for CodecSink<W, B>
                         }
 
                         self.state = SinkState::Buffering(WritePacketState::Data(0));
-                        self.poll_complete()
+                        self.poll_flush(cx)
                     }
 
                     WritePacketState::Data(mut offset) => {
@@ -243,12 +245,14 @@ impl<W, B> Sink for CodecSink<W, B>
                             let packet_ref = self.bytes.as_ref().unwrap().as_ref();
 
                             while (offset as usize) < packet_ref.len() {
-                                let written =
-                                    retry_nb!(self.writer.write(&packet_ref[offset as usize..]));
+                                let written = try_ready!(self.writer
+                                                             .poll_write(cx,
+                                                                         &packet_ref[offset as
+                                                                          usize..]));
 
                                 if written == 0 {
-                                    return Err(io::Error::new(WriteZero,
-                                                              "failed to write packet data"));
+                                    return Err(Error::new(WriteZero,
+                                                          "failed to write packet data"));
                                 } else {
                                     offset += written as u32;
                                     self.state =
@@ -258,36 +262,35 @@ impl<W, B> Sink for CodecSink<W, B>
                         }
 
                         self.state = SinkState::Idle;
-                        self.poll_complete()
+                        self.poll_flush(cx)
                     }
                 }
             }
 
             SinkState::EndOfStream(_) |
-            SinkState::Shutdown => self.close(),
+            SinkState::Shutdown => self.poll_close(cx),
         }
     }
 
-    fn close(&mut self) -> Poll<(), Self::SinkError> {
+    fn poll_close(&mut self, cx: &mut Context) -> Result<Async<()>, Self::SinkError> {
         match self.state {
             SinkState::Idle => {
                 self.state = SinkState::EndOfStream(0);
-                self.close()
+                self.poll_close(cx)
             }
 
             SinkState::Buffering(_) => {
-                try_ready!(self.poll_complete());
+                let _ = try_ready!(self.poll_flush(cx));
                 self.state = SinkState::EndOfStream(0);
-                self.close()
+                self.poll_close(cx)
             }
 
             SinkState::EndOfStream(mut offset) => {
                 while offset < 9 {
-                    let written = retry_nb!(self.writer.write(&ZEROS[offset as usize..]));
+                    let written = try_ready!(self.writer.poll_write(cx, &ZEROS[offset as usize..]));
 
                     if written == 0 {
-                        return Err(io::Error::new(WriteZero,
-                                                  "failed to write end-of-stream header"));
+                        return Err(Error::new(WriteZero, "failed to write end-of-stream header"));
                     } else {
                         offset += written as u8;
                         self.state = SinkState::EndOfStream(offset);
@@ -295,10 +298,10 @@ impl<W, B> Sink for CodecSink<W, B>
                 }
 
                 self.state = SinkState::Shutdown;
-                self.close()
+                self.poll_close(cx)
             }
 
-            SinkState::Shutdown => self.writer.shutdown(),
+            SinkState::Shutdown => self.writer.poll_close(cx),
         }
     }
 }
@@ -343,33 +346,35 @@ impl<R> CodecStream<R> {
 
 impl<R: AsyncRead> Stream for CodecStream<R> {
     type Item = (Box<[u8]>, Metadata);
-    type Error = io::Error;
+    type Error = Error;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Self::Item>, Self::Error> {
         match self.state {
             StreamState::Flags => {
                 let mut flags_buf = [0u8; 1];
-                let read = retry_nb!(self.reader.read(&mut flags_buf));
+                let read = try_ready!(self.reader.poll_read(cx, &mut flags_buf));
 
                 if read == 0 {
-                    Err(io::Error::new(UnexpectedEof, "failed to read packet flags"))
+                    Err(Error::new(UnexpectedEof, "failed to read packet flags"))
                 } else {
                     self.metadata.flags = u8::from_be(flags_buf[0]);
                     if self.metadata.is_unused_packet() {
-                        Err(io::Error::new(InvalidData, "read packet with invalid type flag"))
+                        Err(Error::new(InvalidData, "read packet with invalid type flag"))
                     } else {
                         self.state = StreamState::Length(0, [0; 4]);
-                        self.poll()
+                        self.poll_next(cx)
                     }
                 }
             }
 
             StreamState::Length(mut offset, mut length_buf) => {
                 while offset < 4 {
-                    let read = retry_nb!(self.reader.read(&mut length_buf[offset as usize..]));
+                    let read = try_ready!(self.reader
+                                              .poll_read(cx,
+                                                         &mut length_buf[offset as usize..]));
 
                     if read == 0 {
-                        return Err(io::Error::new(UnexpectedEof, "failed to read packet length"));
+                        return Err(Error::new(UnexpectedEof, "failed to read packet length"));
                     } else {
                         offset += read as u8;
                         self.state = StreamState::Length(offset, length_buf);
@@ -378,15 +383,16 @@ impl<R: AsyncRead> Stream for CodecStream<R> {
 
                 let length = u32::from_be(unsafe { transmute::<[u8; 4], u32>(length_buf) });
                 self.state = StreamState::Id(0, [0; 4], length);
-                self.poll()
+                self.poll_next(cx)
             }
 
             StreamState::Id(mut offset, mut id_buf, length) => {
                 while offset < 4 {
-                    let read = retry_nb!(self.reader.read(&mut id_buf[offset as usize..]));
+                    let read = try_ready!(self.reader.poll_read(cx,
+                                                                &mut id_buf[offset as usize..]));
 
                     if read == 0 {
-                        return Err(io::Error::new(UnexpectedEof, "failed to read packet id"));
+                        return Err(Error::new(UnexpectedEof, "failed to read packet id"));
                     } else {
                         offset += read as u8;
                         self.state = StreamState::Id(offset, id_buf, length);
@@ -397,12 +403,12 @@ impl<R: AsyncRead> Stream for CodecStream<R> {
                 self.metadata.id = id;
 
                 if (length == 0) && (self.metadata.flags == 0) && (self.metadata.id == 0) {
-                    return Ok(Async::Ready(None));
+                    return Ok(Ready(None));
                 }
 
                 self.data = Some(Vec::with_capacity(length as usize));
                 self.state = StreamState::Data(length);
-                self.poll()
+                self.poll_next(cx)
             }
 
             StreamState::Data(length) => {
@@ -414,26 +420,25 @@ impl<R: AsyncRead> Stream for CodecStream<R> {
                 let data_slice = unsafe { from_raw_parts_mut(data_ptr, capacity) };
 
                 while old_len < length as usize {
-                    match self.reader.read(&mut data_slice[old_len..]) {
-                        Ok(0) => {
-                            return Err(io::Error::new(UnexpectedEof,
-                                                      "failed to read whole packet content"));
+                    match self.reader.poll_read(cx, &mut data_slice[old_len..]) {
+                        Ok(Ready(0)) => {
+                            return Err(Error::new(UnexpectedEof,
+                                                  "failed to read whole packet content"));
                         }
-                        Ok(read) => {
+                        Ok(Ready(read)) => {
                             unsafe { data.set_len(old_len + read) };
                             old_len += read;
                         }
-                        Err(ref e) if e.kind() == WouldBlock => {
+                        Ok(Pending) => {
                             self.data = Some(data);
-                            return Ok(Async::NotReady);
+                            return Ok(Pending);
                         }
-                        Err(ref e) if e.kind() == Interrupted => {}
                         Err(e) => return Err(e),
                     }
                 }
 
                 self.state = StreamState::Flags;
-                return Ok(Async::Ready(Some((data.into_boxed_slice(), self.metadata))));
+                return Ok(Ready(Some((data.into_boxed_slice(), self.metadata))));
             }
         }
     }
@@ -443,38 +448,18 @@ impl<R: AsyncRead> Stream for CodecStream<R> {
 mod tests {
     use super::*;
 
-    use std::io::Error;
-
-    use partial_io::{PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
-    use partial_io::quickcheck_types::GenInterruptedWouldBlock;
-    use quickcheck::{QuickCheck, StdGen};
     use async_ringbuffer::*;
-    use rand;
+    use futures::prelude::*;
     use futures::stream::iter_ok;
-    use futures::Future;
+    use futures::sink::close;
+    use futures::executor::block_on;
 
     #[test]
     fn codec_sink_stream() {
-        let rng = StdGen::new(rand::thread_rng(), 2000); // TODO 2000
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(200);
-        quickcheck.quickcheck(test_codec_sink_stream as
-                              fn(usize,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 Vec<u8>)
-                                 -> bool);
-    }
-
-    fn test_codec_sink_stream(buf_size: usize,
-                              write_ops: PartialWithErrors<GenInterruptedWouldBlock>,
-                              read_ops: PartialWithErrors<GenInterruptedWouldBlock>,
-                              data: Vec<u8>)
-                              -> bool {
+        let data: Vec<u8> = (0..255).collect();
         let expected_data = data.clone();
 
-        let (writer, reader) = ring_buffer(buf_size + 1);
-        let writer = PartialAsyncWrite::new(writer, write_ops);
-        let reader = PartialAsyncRead::new(reader, read_ops);
+        let (writer, reader) = ring_buffer(2);
 
         let sink = CodecSink::new(writer);
         let stream = CodecStream::new(reader);
@@ -485,19 +470,17 @@ mod tests {
                                                                                   flags: 0,
                                                                                   id: i as PacketId,
                                                                               })
-                                                                         })));
+                                                                         })))
+            .and_then(|(sink, _)| close(sink));
 
-        let (received, _) = stream.collect().join(send).wait().unwrap();
+        let (received, _) = block_on(stream.collect().join(send)).unwrap();
 
         for (i, &(ref data, ref metadata)) in received.iter().enumerate() {
-            if (i as PacketId) != metadata.id || metadata.is_stream_packet() ||
-               metadata.is_end_packet() ||
-               (!metadata.is_buffer_packet() ||
-                data != &vec![expected_data[i]].into_boxed_slice()) {
-                return false;
-            }
+            assert_eq!((i as PacketId), metadata.id);
+            assert!(!metadata.is_stream_packet());
+            assert!(!metadata.is_end_packet());
+            assert!(metadata.is_buffer_packet());
+            assert_eq!(data, &vec![expected_data[i]].into_boxed_slice());
         }
-
-        return true;
     }
 }
