@@ -5,7 +5,7 @@ authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "Implementation of the packet-stream codec used by muxrpc, in rust."
 repository = "https://github.com/AljoschaMeyer/packet-stream-codec-rs"
 readme = "README.md"
-license = "GPL-3.0"
+license = "AGPL-3.0"
 
 [dependencies]
 futures = "0.1.17"
